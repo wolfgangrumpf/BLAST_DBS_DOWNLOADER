@@ -331,6 +331,35 @@ def fetch_expected_md5(archive_url):
     return parse_md5_file(text)
 
 
+# Sentinel meaning "no checksum supplied; fetch it" (distinct from None = no
+# .md5 exists on the server).
+_FETCH_MD5 = object()
+
+
+def md5_marker_path(archive_path):
+    """Path of the on-disk .md5 marker kept beside a volume (NCBI's convention)."""
+    return archive_path + ".md5"
+
+
+def read_stored_md5(archive_path):
+    """Return the md5 recorded in the local .md5 marker, or None if absent."""
+    try:
+        with open(md5_marker_path(archive_path)) as fh:
+            return parse_md5_file(fh.read())
+    except OSError:
+        return None
+
+
+def write_md5_marker(archive_path, md5hex):
+    """Persist the verified md5 next to the volume as a version marker."""
+    basename = os.path.basename(archive_path)
+    try:
+        with open(md5_marker_path(archive_path), "w") as fh:
+            fh.write(f"{md5hex}  {basename}\n")
+    except OSError:
+        pass
+
+
 def already_extracted(stem, outdir):
     """
     True if files extracted from a volume already exist (e.g. 'nt.12.nhr'
@@ -344,25 +373,35 @@ def already_extracted(stem, outdir):
     return False
 
 
-def download_and_verify_archive(archive_url, outdir, verbose=True):
+def download_and_verify_archive(archive_url, outdir, verbose=True,
+                                expected=_FETCH_MD5):
     """Download one .tar.gz volume and verify it against its .md5.
 
     Returns (path, xfer_seconds, xfer_bytes). xfer_* describe the bytes
     actually pulled over the wire and how long that took (resume-aware), so
     callers can report transmission speed. Both are 0 if nothing was fetched.
 
+    On successful verification the checksum is persisted as a '<archive>.md5'
+    marker so a later run can tell whether an already-extracted volume is still
+    the current upstream version.
+
+    `expected` may be passed in to reuse an already-fetched checksum; by default
+    it is fetched here. (None means the server has no .md5 for this volume.)
+
     Raises DownloadError on unrecoverable failure (safe to call from threads).
     """
     basename = archive_url.rsplit("/", 1)[-1]
     dest = os.path.join(outdir, basename)
 
-    expected = fetch_expected_md5(archive_url)
+    if expected is _FETCH_MD5:
+        expected = fetch_expected_md5(archive_url)
     if expected is None and verbose:
         log(f"  ! warning: no .md5 found for {basename}; cannot verify checksum")
 
     if expected and os.path.exists(dest) and md5_of_file(dest) == expected:
         if verbose:
             log(f"  = {basename} already present and verified; skipping download")
+        write_md5_marker(dest, expected)
         return dest, 0.0, 0
 
     xfer_seconds = 0.0
@@ -387,6 +426,7 @@ def download_and_verify_archive(archive_url, outdir, verbose=True):
         if actual == expected:
             if verbose:
                 log(f"  + checksum OK ({actual})")
+            write_md5_marker(path, expected)
             return path, xfer_seconds, xfer_bytes
 
         if verbose:
@@ -421,18 +461,41 @@ def process_volume(archive_url, outdir, keep, extract, verbose, tracker):
     stem = basename[:-7] if basename.endswith(".tar.gz") else basename
     archive_path = os.path.join(outdir, basename)
     t_start = time.monotonic()
+    prefetched_md5 = _FETCH_MD5
 
     try:
-        # Restart shortcut: in delete-after-extract mode, a finished volume has
-        # no archive left but its extracted files are present -> skip entirely.
+        # Restart currency check: in delete-after-extract mode a finished volume
+        # has no archive left but its extracted files are present. Only skip it
+        # if our stored .md5 marker matches NCBI's CURRENT .md5 (i.e. it's still
+        # the latest version); otherwise fall through and re-download.
         if extract and not keep and not os.path.exists(archive_path) \
                 and already_extracted(stem, outdir):
-            tracker.complete(basename, "already extracted; skipping",
-                             time.monotonic() - t_start, counts_as_work=False)
-            return (archive_url, True, None)
+            current = fetch_expected_md5(archive_url)
+            stored = read_stored_md5(archive_path)
+
+            if current is None:
+                # Server has no checksum to compare against; trust presence.
+                tracker.complete(
+                    basename, "already extracted; skipping (no upstream checksum)",
+                    time.monotonic() - t_start, counts_as_work=False)
+                return (archive_url, True, None)
+
+            if stored == current:
+                tracker.complete(
+                    basename, "already extracted, up to date; skipping",
+                    time.monotonic() - t_start, counts_as_work=False)
+                return (archive_url, True, None)
+
+            # Stale (marker differs) or unverifiable (no marker) -> refresh,
+            # reusing the checksum we just fetched.
+            if verbose:
+                reason = ("upstream version changed" if stored is not None
+                          else "no local version marker")
+                log(f"  i {basename}: {reason}; re-downloading to refresh")
+            prefetched_md5 = current
 
         path, xfer_seconds, xfer_bytes = download_and_verify_archive(
-            archive_url, outdir, verbose=verbose
+            archive_url, outdir, verbose=verbose, expected=prefetched_md5
         )
 
         if extract:
